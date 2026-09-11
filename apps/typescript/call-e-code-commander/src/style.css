@@ -1668,6 +1668,8 @@ body {
 .rota-state[data-state="answered"] { color: var(--green); }
 .rota-state[data-state="noanswer"] { color: var(--text-muted); }
 .rota-state[data-state="failed"] { color: var(--red); }
+/* Reached, decided to wait, and being called back. Not a stall and not a miss. */
+.rota-state[data-state="callback"] { color: var(--amber); }
 
 .country-helper-pills {
   display: flex;
@@ -2087,3 +2089,49 @@ body {
 }
 
 .key-warning[data-mode="simulation"] strong { color: var(--cyan); }
+
+/* --------------------------------------------------------------------------
+   Agreed callback
+   The ladder is holding rather than climbing, which looks identical to a stall
+   unless the interface says otherwise. Amber, because nothing is wrong and
+   nothing is finished.
+   -------------------------------------------------------------------------- */
+.callback-panel {
+  margin-top: 12px;
+  border: 1px solid var(--border-subtle);
+  border-left: 3px solid var(--amber);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 176, 32, 0.06);
+  padding: 12px;
+}
+
+.callback-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.callback-icon { font-size: 1.05rem; }
+
+.callback-title {
+  font-size: 0.85rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.callback-detail {
+  font-size: 0.76rem;
+  line-height: 1.5;
+  opacity: 0.85;
+  margin-bottom: 8px;
+}
+
+.callback-countdown {
+  font-family: var(--font-mono, monospace);
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: var(--amber);
+  margin-bottom: 10px;
+  font-variant-numeric: tabular-nums;
+}

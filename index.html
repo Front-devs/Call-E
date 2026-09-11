@@ -420,6 +420,9 @@ export async function authenticate(req, res) {
         </div>
         <div class="modal-footer">
           <button id="copyReportBtn" class="btn btn-glass">📋 Copy Markdown</button>
+          <!-- The audit trail as a file, because a post-incident review attaches
+               evidence to a ticket rather than pasting it out of a clipboard. -->
+          <button id="downloadAuditBtn" class="btn btn-glass hidden">⬇️ Download audit file</button>
           <button id="mergePrBtn" class="btn btn-accent">
             <span>🚀 Approve & Auto-Merge Hotfix</span>
           </button>
@@ -514,6 +517,20 @@ export async function authenticate(req, res) {
             <div id="realCallId" class="status-box-id">No call task yet</div>
             <div id="realCallActivity" class="status-box-activity">Enter a number and page the rota.</div>
 
+            <!-- Shown only while an agreed callback is being waited out. The
+                 ladder is deliberately not climbing during this window, so the
+                 panel says why, and offers to ring early if the engineer is
+                 ready before the clock is. -->
+            <div id="callbackPanel" class="callback-panel hidden">
+              <div class="callback-head">
+                <span class="callback-icon">⏱️</span>
+                <span class="callback-title" id="callbackTitle">Callback agreed</span>
+              </div>
+              <div class="callback-detail" id="callbackDetail"></div>
+              <div class="callback-countdown" id="callbackCountdown">—</div>
+              <button id="callBackNowBtn" class="btn btn-xs btn-accent">📞 Call back now</button>
+            </div>
+
             <div id="decisionCard" class="decision-card hidden">
               <div class="decision-head">
                 <span class="decision-icon" id="decisionIcon">⏳</span>
@@ -526,6 +543,9 @@ export async function authenticate(req, res) {
                 <div><dt>Who answered</dt><dd id="decisionReached">—</dd></div>
                 <div><dt>Task completed</dt><dd id="decisionCompleted">—</dd></div>
                 <div><dt>Call task</dt><dd id="decisionCallId">—</dd></div>
+                <!-- Page raised to human decision. The number a post-incident
+                     review asks for, and the one a notification cannot produce. -->
+                <div><dt>Time to decision</dt><dd id="decisionElapsed">—</dd></div>
               </dl>
               <div class="decision-reason" id="decisionReason"></div>
               <div class="decision-evidence hidden" id="decisionEvidenceWrap">

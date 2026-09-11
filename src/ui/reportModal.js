@@ -4,6 +4,7 @@
  */
 
 import { soundEngine } from '../audio/soundEngine.js';
+import { auditFileName } from '../agents/auditTrail.js';
 
 export class ReportModalController {
   constructor(options = {}) {
@@ -12,7 +13,9 @@ export class ReportModalController {
     this.modalContentEl = document.getElementById('reportModalContent');
     this.closeBtn = document.getElementById('closeReportModalBtn');
     this.copyBtn = document.getElementById('copyReportBtn');
+    this.downloadAuditBtn = document.getElementById('downloadAuditBtn');
     this.mergeBtn = document.getElementById('mergePrBtn');
+    this.activeAudit = null;
 
     // Custom incident modal elements
     this.customModalEl = document.getElementById('customIncidentModal');
@@ -45,6 +48,10 @@ export class ReportModalController {
       });
     }
 
+    if (this.downloadAuditBtn) {
+      this.downloadAuditBtn.addEventListener('click', () => this.downloadAudit());
+    }
+
     if (this.mergeBtn) {
       this.mergeBtn.addEventListener('click', () => {
         soundEngine.playSuccessFanfare();
@@ -70,12 +77,39 @@ export class ReportModalController {
     }
   }
 
+  /**
+   * Writes the audit record out as a file the reviewer keeps.
+   *
+   * A blob and an anchor, so the file never leaves the browser. The trail holds
+   * the transcript of a call to a real person and the number that was dialled,
+   * and posting that to a server to turn it into a download would be sending
+   * exactly the data this project keeps off the wire everywhere else.
+   */
+  downloadAudit() {
+    if (!this.activeAudit) return;
+
+    const blob = new Blob([JSON.stringify(this.activeAudit, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = auditFileName(this.activeAudit.incidentId);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+
+    const orig = this.downloadAuditBtn.textContent;
+    this.downloadAuditBtn.textContent = '✓ Saved';
+    setTimeout(() => { this.downloadAuditBtn.textContent = orig; }, 1800);
+  }
+
   showPullRequest(scenario) {
     if (!scenario || !this.modalEl) return;
 
     this.modalTitleEl.textContent = `GitHub Pull Request #1402 — Hotfix for ${scenario.service}`;
     // The post-mortem view hides this button, so restore it when reopening the PR.
     this.mergeBtn.style.display = '';
+    this.downloadAuditBtn?.classList.add('hidden');
     this.mergeBtn.disabled = false;
     this.mergeBtn.textContent = '🚀 Approve & Auto-Merge Hotfix';
 
@@ -132,11 +166,16 @@ export class ReportModalController {
    * needs to see who authorised the production change, on which phone number,
    * in their own words, and how confident CALL-E was that it heard them right.
    */
-  showRcaReport(scenario, outcome = null) {
+  showRcaReport(scenario, outcome = null, audit = null) {
     if (!scenario || !this.modalEl) return;
 
     this.modalTitleEl.textContent = `📑 Incident Post-Mortem: ${scenario.service}`;
     this.mergeBtn.style.display = 'none';
+
+    // Offered only when there is a trail to download. A button that exports an
+    // empty file is worse than no button.
+    this.activeAudit = audit;
+    this.downloadAuditBtn?.classList.toggle('hidden', !audit);
 
     const trailMarkdown = buildAuthorisationTrail(outcome, 'markdown');
     const trailHtml = buildAuthorisationTrail(outcome, 'html');
@@ -237,19 +276,46 @@ function buildAuthorisationTrail(outcome, format) {
       : `<p><strong>CALL-E extraction confidence:</strong> ${pct}</p>`);
   }
 
+  // The number every review asks for. Measured from the page being raised, so
+  // an unanswered first rung counts against it, which is the honest reading:
+  // production was undecided for that whole time.
+  if (typeof outcome.elapsedMs === 'number') {
+    const elapsed = formatDuration(outcome.elapsedMs);
+    lines.push(md
+      ? `**Time from page raised to human decision**: ${elapsed}`
+      : `<p><strong>Time from page raised to human decision:</strong> ${elapsed}</p>`);
+  }
+
   const rungs = outcome.rungs || [];
   if (rungs.length > 0) {
     const rows = rungs.map((rung, i) => {
       const reached = rung.outcome?.reachedEngineer ? 'answered' : 'no answer';
       const call = rung.callId ? ` (call ${rung.callId})` : rung.mode === 'simulated' ? ' (simulated)' : '';
-      return md
-        ? `${i + 1}. ${rung.contact?.name || 'Unknown'} — ${reached}${call}`
-        : `<li>${rung.contact?.name || 'Unknown'} — ${reached}${call}</li>`;
+      // A second call to the same person is not a redial. It happened because
+      // they asked for it, and the trail has to say so or the rota looks like
+      // it was pestered.
+      const attempt = (rung.attempt ?? 1) > 1 ? ' — agreed callback' : '';
+      const deferred = rung.callback
+        ? ` — asked for ${rung.callback.requestedMinutes} min${rung.callback.endedBy === 'skipped' ? ', called back early by the operator' : ''}`
+        : '';
+      const took = typeof rung.durationMs === 'number' ? ` [${formatDuration(rung.durationMs)}]` : '';
+      const text = `${rung.contact?.name || 'Unknown'} — ${reached}${attempt}${deferred}${call}${took}`;
+      return md ? `${i + 1}. ${text}` : `<li>${text}</li>`;
     });
     lines.push(md ? `\n**Rungs dialled**\n${rows.join('\n')}` : `<p><strong>Rungs dialled:</strong></p><ol>${rows.join('')}</ol>`);
   }
 
   return lines.join(md ? '\n\n' : '');
+}
+
+/** Duration in the units a person writing up an incident would use. */
+function formatDuration(ms) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return 'not measured';
+  const totalSeconds = Math.round(ms / 1000);
+  if (totalSeconds < 60) return `${totalSeconds} seconds`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds === 0 ? `${minutes} minutes` : `${minutes} minutes ${seconds} seconds`;
 }
 
 const DECISION_LABELS = {

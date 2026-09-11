@@ -18,6 +18,7 @@ import { TerminalSandbox } from './ui/terminalSandbox.js';
 import { ReportModalController } from './ui/reportModal.js';
 import { calleService, CalleIncidentCommander, INCIDENT_DECISION_SCHEMA, isPersonName, hasRecipientTurn } from './agents/calleService.js';
 import { EscalationLadder } from './agents/escalationLadder.js';
+import { buildAuditRecord } from './agents/auditTrail.js';
 import { scanCode, primaryFinding, buildAnnotatedDiff, describeScan } from './agents/codeScanner.js';
 
 const ROTA_STORAGE_KEY = 'calle_rota_v2';
@@ -70,10 +71,16 @@ class CallEApp {
       const res = await fetch('/api/calle/mode', { headers: { accept: 'application/json' } });
       if (res.ok) {
         const mode = await res.json();
+        this.serverMode = mode;
         if (mode?.serverKey) {
           calleService.enableProxyMode(mode.baseUrl || '/api/calle');
           live = true;
         }
+        // Asking CALL-E to deliver terminal state to a receiver that exists is
+        // what lets an escalation outlive the tab. With none configured the
+        // ladder polls, which is correct rather than degraded: it just stops
+        // when the page does, and the interface says so.
+        this.webhookReady = calleService.setWebhookUrl(mode?.webhookUrl);
         this.seedRota(mode?.rota);
       }
     } catch (err) {
@@ -90,8 +97,14 @@ class CallEApp {
     const bannerText = document.getElementById('modeBannerText');
     if (banner && bannerText) {
       banner.dataset.mode = live ? 'live' : 'simulation';
+      // A hosted copy will only ring numbers its owner nominated, and a reviewer
+      // who types their own number deserves to know that before they press the
+      // button rather than from a refusal afterwards.
+      const restricted = live && this.serverMode?.dialling?.restricted;
       bannerText.textContent = live
-        ? 'Live mode. The server holds a CALL-E key, so paging the rota will ring a real phone and spend credits.'
+        ? restricted
+          ? 'Live mode on a hosted demo. It rings only the numbers its owner nominated, so it cannot be used to call anyone else. Simulation runs the whole ladder for any number.'
+          : 'Live mode. The server holds a CALL-E key, so paging the rota will ring a real phone and spend credits.'
         : 'Simulation mode. No phone will ring and no credits are spent.';
     }
 
@@ -167,6 +180,13 @@ class CallEApp {
     this.decisionEvidence = $('decisionEvidence');
     this.decisionEvidenceWrap = $('decisionEvidenceWrap');
     this.decisionTranscript = $('decisionTranscript');
+    this.decisionElapsed = $('decisionElapsed');
+
+    this.callbackPanel = $('callbackPanel');
+    this.callbackTitle = $('callbackTitle');
+    this.callbackDetail = $('callbackDetail');
+    this.callbackCountdown = $('callbackCountdown');
+    this.callBackNowBtn = $('callBackNowBtn');
 
     // Per-call transcript rendering state, reset whenever a new rung starts.
     this.transcriptCallId = null;
@@ -268,6 +288,12 @@ class CallEApp {
     }
     if (!saved?.callId || !calleService.isLiveMode) return;
 
+    // What the server recorded while nobody was watching. The browser missed
+    // any rung that finished after the tab closed, and those outcomes are the
+    // ones a returning operator most needs, because they are the ones they
+    // cannot reconstruct by looking at the screen.
+    await this.recoverIncidentFromServer(saved.incidentId);
+
     const snapshot = await calleService.pollCall(saved.callId, { name: saved.contactName });
     if (!snapshot || snapshot.error) return;
 
@@ -295,6 +321,50 @@ class CallEApp {
       }, true);
       this.clearInFlightCall();
     }
+  }
+
+  /**
+   * Reads back the call outcomes the server recorded for an incident.
+   *
+   * These arrive from the webhook receiver, which never trusts a delivery body:
+   * every field it stored was re-read from the CALL-E API with the server key.
+   * So this is a replay of verified history, not a second opinion, and it is
+   * the only way the page learns about a rung that finished while the tab was
+   * closed.
+   */
+  async recoverIncidentFromServer(incidentId) {
+    if (!incidentId) return null;
+
+    let record;
+    try {
+      const res = await fetch(`/api/calle/incident/${encodeURIComponent(incidentId)}`, {
+        headers: { accept: 'application/json' }
+      });
+      if (!res.ok) return null;
+      record = await res.json();
+    } catch (err) {
+      // No receiver deployed, or it is unreachable. Polling still covers the
+      // case where somebody is watching, which is the case we are in.
+      return null;
+    }
+
+    if (!record?.found || !record.calls?.length) return null;
+
+    this.terminal.log(`[RECOVERY] The server recorded ${record.calls.length} completed call(s) for ${incidentId} while this page was closed.`, 'amber');
+    if (!record.persistent) {
+      this.terminal.log('[RECOVERY] That record lives in memory on the server and is lost when the instance recycles.', 'dim');
+    }
+
+    record.calls.forEach((call) => {
+      const answerer = CalleIncidentCommander.describeAnswerer(call.answeredBy);
+      const decision = CalleIncidentCommander.describeDecision(call.decision);
+      this.terminal.log(
+        `[RECOVERY] Call ${call.callId} to ${call.contactRole || 'the rota'}: answered by ${answerer}, ${decision}.`,
+        call.authorised ? 'green' : 'amber'
+      );
+    });
+
+    return record;
   }
 
   newIncidentId() {
@@ -450,6 +520,16 @@ class CallEApp {
       this.handleCallAccepted();
     });
 
+    // The engineer came back before their own deadline. Ringing them now is
+    // what they asked for, and it is recorded as an operator ending the wait
+    // rather than as the agreed time having passed.
+    this.callBackNowBtn?.addEventListener('click', () => {
+      if (this.ladder?.callBackNow()) {
+        this.callbackCountdown.textContent = '00:00';
+        this.terminal.log('[ESCALATION] Callback wait ended early by the operator.', 'cyan');
+      }
+    });
+
     this.dispatchRealCallBtn?.addEventListener('click', () => this.pageTheRota());
 
     // Keep the call-script preview in step with the rota, so nobody spends a
@@ -520,7 +600,19 @@ class CallEApp {
     };
 
     this.openPrBtn?.addEventListener('click', () => this.reportModal.showPullRequest(this.currentScenario));
-    this.exportRcaBtn?.addEventListener('click', () => this.reportModal.showRcaReport(this.currentScenario, this.agentMesh.lastOutcome));
+    this.exportRcaBtn?.addEventListener('click', () => {
+      const outcome = this.agentMesh.lastOutcome;
+      const audit = outcome
+        ? buildAuditRecord({
+            scenario: this.currentScenario,
+            outcome,
+            incidentId: this.incidentId,
+            isLive: calleService.isLiveMode,
+            connectionMode: calleService.connectionMode
+          })
+        : null;
+      this.reportModal.showRcaReport(this.currentScenario, outcome, audit);
+    });
     this.resetDemoBtn?.addEventListener('click', () => this.reset());
   }
 
@@ -538,6 +630,7 @@ class CallEApp {
     this.clearValidationNotice();
     this.resetRungStates();
     this.hideDecisionCard();
+    this.hideCallbackPanel();
 
     const rota = this.readRota();
     const armed = rota.filter((c) => c.phone);
@@ -700,7 +793,43 @@ class CallEApp {
         }
         break;
 
+      case 'rung:callback-scheduled': {
+        const who = event.contact.displayName || event.contact.name;
+        this.setRungState(contactId, 'callback', `callback in ${event.minutes}m`);
+        this.setLadderBadge(`CALLBACK AGREED WITH ${who.toUpperCase()}`, 'amber');
+        this.showCallbackPanel(event);
+        this.terminal.log(
+          `[ESCALATION] ${who} asked for ${event.requestedMinutes} minute(s) before deciding.${event.capped ? ` Capped to ${event.minutes}, the longest this ladder waits.` : ''} The backup is NOT being woken.`,
+          'amber'
+        );
+        if (event.simulatedWait) {
+          this.terminal.log('[SIMULATED] The wait is compressed for the demo. Nothing is dialled either way.', 'dim');
+        }
+        break;
+      }
+
+      case 'rung:callback-dialing': {
+        const who = event.contact.displayName || event.contact.name;
+        this.hideCallbackPanel();
+        this.terminal.log(
+          `[ESCALATION] Calling ${who} back as agreed${event.endedBy === 'skipped' ? ', early, at the operator\'s request' : ` after ${event.minutes} minute(s)`}.`,
+          'cyan'
+        );
+        break;
+      }
+
+      case 'rung:callback-refused': {
+        const who = event.contact.displayName || event.contact.name;
+        this.hideCallbackPanel();
+        this.terminal.log(
+          `[ESCALATION] ${who} asked for a second callback. They have already had one on this incident, so the ladder is climbing instead.`,
+          'amber'
+        );
+        break;
+      }
+
       case 'rung:escalating':
+        this.hideCallbackPanel();
         if (event.hasNext) {
           this.terminal.log(`[ESCALATION] Climbing to the next rung. Reason: ${event.reason}`, 'amber');
         }
@@ -710,11 +839,13 @@ class CallEApp {
         const sim = !calleService.isLiveMode;
         const label = event.authorised ? 'AUTHORISED' : 'DECIDED — HELD';
         this.setLadderBadge(sim ? `SIMULATED — ${label}` : label, sim ? 'cyan' : event.authorised ? 'green' : 'amber');
+        this.hideCallbackPanel();
         break;
       }
 
       case 'ladder:exhausted':
         this.setLadderBadge(calleService.isLiveMode ? 'NO AUTHORISATION' : 'SIMULATED — NO AUTHORISATION', calleService.isLiveMode ? 'pink' : 'cyan');
+        this.hideCallbackPanel();
         break;
 
       default:
@@ -869,6 +1000,14 @@ class CallEApp {
       : 'simulated';
     this.decisionCallId.textContent = lastRung?.callId || (isLive ? 'none placed' : 'simulated');
 
+    if (this.decisionElapsed) {
+      // Counted from the page being raised, not from a call connecting, because
+      // an unanswered rung is part of how long production ran undecided.
+      this.decisionElapsed.textContent = typeof outcome.elapsedMs === 'number'
+        ? describeDuration(outcome.elapsedMs)
+        : 'not measured';
+    }
+
     // Evidence is CALL-E's own justification for the outcome it reported, which
     // is exactly what a post-incident reviewer will want to check.
     const evidence = snapshot?.evidence || [];
@@ -895,6 +1034,54 @@ class CallEApp {
 
   hideDecisionCard() {
     this.decisionCard?.classList.add('hidden');
+  }
+
+  /**
+   * Shows the agreed callback, counting down.
+   *
+   * A ladder that has stopped climbing on purpose looks exactly like a ladder
+   * that has hung, unless something on screen says which one it is. The panel
+   * says who asked, how long for, and what is not happening in the meantime.
+   */
+  showCallbackPanel(event) {
+    if (!this.callbackPanel) return;
+    const who = event.contact.displayName || event.contact.name;
+
+    this.callbackTitle.textContent = `${who} asked for ${event.requestedMinutes} minute(s)`;
+    this.callbackDetail.textContent = [
+      event.capped
+        ? `Waiting ${event.minutes} minutes, the longest this ladder holds before climbing anyway.`
+        : `Waiting ${event.minutes} minutes, then calling them back.`,
+      'Nothing ships while this runs, and nobody else on the rota is being woken.',
+      event.simulatedWait ? 'Simulated run, so the wait is compressed. No phone will ring.' : ''
+    ].filter(Boolean).join(' ');
+
+    this.callbackPanel.classList.remove('hidden');
+    this.startCallbackCountdown(new Date(event.dueAt).getTime());
+  }
+
+  hideCallbackPanel() {
+    this.stopCallbackCountdown();
+    this.callbackPanel?.classList.add('hidden');
+  }
+
+  startCallbackCountdown(dueAt) {
+    this.stopCallbackCountdown();
+    const tick = () => {
+      const remaining = Math.max(0, dueAt - Date.now());
+      const totalSeconds = Math.round(remaining / 1000);
+      const mins = String(Math.floor(totalSeconds / 60)).padStart(2, '0');
+      const secs = String(totalSeconds % 60).padStart(2, '0');
+      if (this.callbackCountdown) this.callbackCountdown.textContent = `${mins}:${secs}`;
+      if (remaining <= 0) this.stopCallbackCountdown();
+    };
+    tick();
+    this.callbackTimer = setInterval(tick, 1000);
+  }
+
+  stopCallbackCountdown() {
+    if (this.callbackTimer) clearInterval(this.callbackTimer);
+    this.callbackTimer = null;
   }
 
   setLadderBadge(text, tone) {
@@ -1096,6 +1283,22 @@ class CallEApp {
  * test suite. For pasted code neither of those exists, and showing a fabricated
  * one would misrepresent what the system actually did.
  */
+/**
+ * Renders a duration the way a person reading a post-mortem would say it.
+ *
+ * Seconds below a minute, because "0.7 minutes" is nobody's unit, and minutes
+ * and seconds above it. Rounded, never padded with precision the measurement
+ * does not have.
+ */
+function describeDuration(ms) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return 'not measured';
+  const totalSeconds = Math.round(ms / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds === 0 ? `${minutes}m` : `${minutes}m ${seconds}s`;
+}
+
 function buildScanReport(scan, fileName) {
   const header = [
     `Static scan of ${fileName}`,

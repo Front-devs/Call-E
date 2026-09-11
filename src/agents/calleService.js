@@ -156,6 +156,11 @@ export class CalleIncidentCommander {
     this.useProxy = false;
     this.proxyBaseUrl = '/api/calle';
 
+    // Where CALL-E should post terminal call state. Null until the server says
+    // it has a receiver, because an unreachable URL is worse than none: the
+    // ladder would wait on a delivery that is never coming.
+    this.webhookUrl = null;
+
     const envKey = (typeof process !== 'undefined' && process.env?.CALLE_API_KEY) || null;
     this.setApiKey(apiKey || envKey);
   }
@@ -300,6 +305,22 @@ export class CalleIncidentCommander {
     return this.isLiveMode;
   }
 
+  /**
+   * Registers the webhook receiver CALL-E should post terminal call state to.
+   *
+   * Only an absolute HTTPS URL is accepted, because that is what the platform
+   * takes and because a relative path here would silently produce calls with no
+   * delivery target at all. A local dev server has no public address, so this
+   * stays unset there and the ladder keeps polling, which is the correct
+   * behaviour rather than a degraded one.
+   *
+   * @returns {boolean} Whether a receiver is now registered.
+   */
+  setWebhookUrl(url) {
+    this.webhookUrl = typeof url === 'string' && /^https:\/\/[^\s]+$/i.test(url.trim()) ? url.trim() : null;
+    return Boolean(this.webhookUrl);
+  }
+
   /** How the current live connection reaches CALL-E, for display and audit. */
   get connectionMode() {
     if (!this.isLiveMode) return 'simulation';
@@ -316,9 +337,22 @@ export class CalleIncidentCommander {
    * The same incident escalating to the same contact must never dial twice
    * because of a retry, a double-clicked button, or a page reload. The key is
    * derived only from stable business identifiers, never from a timestamp.
+   *
+   * A requested callback is the one case where dialling the same person for the
+   * same incident a second time is correct rather than a bug, because they asked
+   * for it on the first call. That intent is carried in the key as an explicit
+   * attempt number, so the second call is a different request and the first key
+   * still protects against every accidental redial. An attempt number is never
+   * derived from a clock: attempt 2 exists because an engineer asked for it, not
+   * because time passed.
+   *
+   * @param {string} incidentId
+   * @param {string} contactId
+   * @param {number} [attempt] 1 for the first page, 2+ for a requested callback.
    */
-  buildIdempotencyKey(incidentId, contactId) {
-    return `incident:${incidentId}:notify:${contactId}:v1`;
+  buildIdempotencyKey(incidentId, contactId, attempt = 1) {
+    const base = `incident:${incidentId}:notify:${contactId}:v1`;
+    return attempt > 1 ? `${base}:callback:${attempt}` : base;
   }
 
   /**
@@ -347,12 +381,20 @@ export class CalleIncidentCommander {
       ? `\nYou are calling because ${escalation.escalatedFrom} did not answer or could not decide. Say so at the start.`
       : '';
 
+    // A callback was asked for by the person being called, so the second call
+    // has to sound like the continuation it is. Opening with the same cold
+    // script would read as a system that did not listen the first time, and the
+    // engineer would have to establish context again with the clock running.
+    const callbackNote = escalation.callbackMinutes > 0
+      ? `\nThis is the callback you agreed. You spoke to this person about ${escalation.callbackMinutes} minute(s) ago about this same incident and they asked you to call back then rather than deciding on the spot. Open by reminding them of that, ask whether they have had a chance to look, then ask for the decision again. Do not repeat the full briefing unless they ask for it.`
+      : '';
+
     const whoLine = named
       ? `Call ${contact.name}, the ${contact.role} on the rota, and hold a real two-way conversation.`
       : `Call the ${contact.role} on the rota and hold a real two-way conversation.`;
 
     return `You are CALL-E, the automated incident commander for an engineering on-call rota.
-${whoLine}${escalationNote}
+${whoLine}${escalationNote}${callbackNote}
 
 OPENING
 Say who you are and that this is an automated page for a live production incident.
@@ -398,14 +440,14 @@ Keep the whole call under three minutes.`;
    * Returns { mode } of either 'live' or 'simulated'. Simulated mode never
    * claims to have called anyone; the UI is expected to label it as such.
    */
-  async placeIncidentCall({ scenario, contact, incidentId, escalatedFrom = null }) {
+  async placeIncidentCall({ scenario, contact, incidentId, escalatedFrom = null, attempt = 1, callbackMinutes = 0 }) {
     const check = this.validatePhoneNumber(contact.phone);
     if (!check.valid) {
       return { mode: 'error', error: check.error, contact };
     }
 
-    const task = this.buildTaskPrompt(scenario, contact, { escalatedFrom });
-    const idempotencyKey = this.buildIdempotencyKey(incidentId, contact.id);
+    const task = this.buildTaskPrompt(scenario, contact, { escalatedFrom, callbackMinutes });
+    const idempotencyKey = this.buildIdempotencyKey(incidentId, contact.id, attempt);
 
     if (!this.isLiveMode || !this.client) {
       return {
@@ -430,6 +472,10 @@ Keep the whole call under three minutes.`;
             locale: contact.locale || check.region?.locale
           },
           recipientResultSchema: INCIDENT_DECISION_SCHEMA,
+          // Set only when a receiver is configured, so a checkout with no
+          // webhook endpoint does not ask CALL-E to post terminal state into
+          // the void and then wait on a delivery that cannot arrive.
+          ...(this.webhookUrl ? { webhookUrl: this.webhookUrl } : {}),
           metadata: {
             incident_id: incidentId,
             service: scenario.service,
@@ -437,7 +483,10 @@ Keep the whole call under three minutes.`;
             error_code: scenario.errorCode,
             contact_id: contact.id,
             contact_role: contact.role,
-            escalated_from: escalatedFrom || 'none'
+            escalated_from: escalatedFrom || 'none',
+            // Carried so the webhook receiver can tell a first page from a
+            // callback without holding state of its own.
+            attempt: String(attempt)
           }
         },
         { idempotencyKey }
@@ -450,6 +499,7 @@ Keep the whole call under three minutes.`;
         contact,
         task,
         idempotencyKey,
+        attempt,
         startedAt: call.createdAt
       };
     } catch (err) {
@@ -560,6 +610,10 @@ Keep the whole call under three minutes.`;
         completionConfidence: call.completionConfidence,
         evidence: call.evidence || [],
         structuredResult: recipient?.structuredResult ?? call.structuredResult ?? null,
+        // Echoed back by CALL-E on the call it was set on. The webhook receiver
+        // reads the incident correlation ids from here rather than from the
+        // delivery body, because this copy came back over an authenticated read.
+        metadata: call.metadata || {},
         failureCode: call.failureCode || attempt?.failureCode || null,
         failureMessage: call.failureMessage || attempt?.failureMessage || null,
         transcript: (attempt?.transcriptTurns || []).map((turn) => ({
@@ -622,6 +676,7 @@ Keep the whole call under three minutes.`;
         reachedEngineer: false,
         authorised: false,
         shouldEscalate: true,
+        requestedCallback: false,
         reason: 'No call state available.',
         confidence: null
       };
@@ -649,6 +704,7 @@ Keep the whole call under three minutes.`;
         reachedEngineer: false,
         authorised: false,
         shouldEscalate: true,
+        requestedCallback: false,
         reason: snapshot.failureMessage
           ? `The call did not complete. CALL-E reported: ${snapshot.failureMessage}`
           : 'The call did not complete, and CALL-E gave no reason that establishes why.',
@@ -682,12 +738,37 @@ Keep the whole call under three minutes.`;
       && taskReachedEndState
       && AUTHORISING_DECISIONS.has(decision);
 
+    const callbackMinutes = Number.isInteger(result.callback_minutes) ? result.callback_minutes : null;
+
+    // An engineer who asks for ten minutes has not failed to decide. They have
+    // decided to look before deciding, which is a normal and often correct
+    // response to being woken at 3am and asked to authorise a change to
+    // production. Escalating past them would wake the backup to ask a question
+    // the primary is already awake and working on, and it would teach the rota
+    // that asking for time gets your colleague called.
+    //
+    // It requires the same corroboration as an authorisation, for a plain
+    // reason: this is the branch that stops the ladder, and a misheard "call me
+    // back" would leave a live incident sitting on a timer with nobody else
+    // told. When the extraction is weak, waking the next person is the safer
+    // reading of an unclear call.
+    const requestedCallback =
+      reachedEngineer
+      && confidenceOk
+      && taskReachedEndState
+      && !authorised
+      && decision === 'no_decision'
+      && callbackMinutes !== null
+      && callbackMinutes > 0;
+
     const shouldEscalate =
-      !reachedEngineer ||
-      decision === 'escalate_to_backup' ||
-      decision === 'no_decision' ||
-      !confidenceOk ||
-      !taskReachedEndState;
+      !requestedCallback && (
+        !reachedEngineer ||
+        decision === 'escalate_to_backup' ||
+        decision === 'no_decision' ||
+        !confidenceOk ||
+        !taskReachedEndState
+      );
 
     return {
       decision,
@@ -699,9 +780,10 @@ Keep the whole call under three minutes.`;
       confidenceLabel: snapshot.completionConfidence?.label ?? null,
       lowConfidence: !confidenceOk,
       taskCompleted: snapshot.taskCompleted ?? null,
+      requestedCallback,
       reason: result.reason || snapshot.summary || 'No reason recorded.',
       acknowledgedSeverity: result.acknowledged_severity === 'yes',
-      callbackMinutes: Number.isInteger(result.callback_minutes) ? result.callback_minutes : null,
+      callbackMinutes,
       questionsAsked: Array.isArray(result.questions_asked) ? result.questions_asked : [],
       evidence: snapshot.evidence || []
     };

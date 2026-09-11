@@ -17,7 +17,7 @@ const target = path.join(root, 'apps', 'typescript', 'call-e-code-commander');
 
 /** Files and directories that belong in the submitted app directory. */
 const INCLUDE = [
-  'index.html', 'package.json', 'vite.config.js', 'vercel.json', '.gitignore', '.env.example',
+  'index.html', 'package.json', 'vite.config.js', 'vercel.json', '.gitignore', '.env.example', 'LICENSE',
   'api', 'src', 'test', 'scripts'
 ];
 
